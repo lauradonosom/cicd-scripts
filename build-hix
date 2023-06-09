@@ -1,0 +1,629 @@
+#!/bin/bash -e
+
+usage()
+{
+  echo "${cmd}: Usage: ${cmd} [--help] [--no-update] [--deploy] --buildnum=number --profile='profile profile ..' --branch=branch-name --mvn-settings=settings"
+}
+
+set_env()
+{
+  if [[ ${local_mvn_settings} ]]; then
+    mvn_settings=${local_mvn_settings}
+  else
+    mvn_settings="-Dmaven.repo.local=${m2_path} --global-settings=${m2_path}/settings.xml --settings=${m2_path}/settings.xml"
+  fi
+
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" # This loads nvm
+  [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" # This loads nvm bash_completion
+
+  mkdir -p ${m2_path}
+  if ${update_artifactory}; then
+    cp ${HOME}/config/${settings_xml} ${m2_path}/settings.xml
+  else
+    sed -e "/<username>/d" -e "/<password>/d" ${HOME}/config/${settings_xml} > ${m2_path}/settings.xml
+  fi
+  # ENGSVC-2203 setting java home and mvn argument to take java as OpenJdk15
+
+  if [[ "${use_OpenJDK16}" == "true" ]]; then
+    export JAVA_HOME="/usr/lib/jvm/jdk-16.0.1"
+    export MAVEN_OPTS="--illegal-access=permit"
+    export MVN_ARGS="-Dskip.npm ${verbose} -B -U -DuseIncrementalCompilation=false ${mvn_settings} -DaltDeploymentRepository=ghixbuild::default::${artifactory_url}"
+  elif [[ "${use_JDK17}" == "true" ]]; then
+    export JAVA_HOME="/usr/lib/jvm/jdk-17.0.4"
+    export MAVEN_OPTS="--illegal-access=permit"
+    export MVN_ARGS="-Dskip.npm ${verbose} -B -U -DuseIncrementalCompilation=false ${mvn_settings} -DaltDeploymentRepository=ghixbuild::default::${artifactory_url}"
+  else
+    export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/jdk-8u60-linux-x64/jdk1.8.0_77}
+    export MVN_ARGS="-Dskip.npm ${verbose} -B -U -DuseIncrementalCompilation=false ${mvn_settings} -Djdk.version=1.8  -DaltDeploymentRepository=ghixbuild::default::${artifactory_url}"
+  fi
+  #######  [[ ${build_target} == "deploy" ]] || MVN_ARGS="${MVN_ARGS} -o"
+  export MVN_HOME="/usr/local/apache-maven-3.3.9"
+  export PATH=${JAVA_HOME}/bin:${MVN_HOME}/bin:/usr/local/bin:${PATH}
+  export SRC_HOME=$(pwd)
+  export LC_ALL=en_US.UTF-8
+}
+
+source()
+{
+  local _dir
+  local _repo
+  local _br
+  local _cid
+  local _profile
+  local _f
+
+  _dir=$1
+  _repo=$2
+  _br=$3
+  _profile=${4:-shared} #default is shared. This ensures that we generate
+			# the build number.
+
+  if [[ $(eval echo \$${_dir}_build) == "false" ]]; then
+    echo "Skipping fetch source in ${_dir} for ${_repo}, branch ${_br}"
+    return
+  fi
+
+  get_source ${_dir} ${_repo} ${_br} ${_profile}
+  echo "done get_source $*"
+}
+
+build()
+{
+  local _dir
+  local _rv
+  local _local_mvn_args
+
+  _dir=$1
+  
+  if [[ $(eval echo \$${_dir}_build) == "false" ]] ; then
+    echo "$(date): Skipping build of ${_dir}"
+    return
+  fi
+
+  echo "$(date): build: checking artifactory ${_dir}"
+  cd ${_dir}
+  #
+  # Use the shrink-ray test as a proxy to enable platform tests.
+  #
+#  git merge-base --is-ancestor SHRINK-RAY HEAD 2>/dev/null || \
+#
+  if [[ ! ${profile} = phix ]] && git merge-base --is-ancestor SJC-ARTIFACTORY HEAD; then
+    artifactory_url=${sjc_artifactory}
+    m2_path=${sjc_m2}
+    settings_xml=${settings_xml_sjc}
+    set_env
+  fi
+  echo "$(date): finished artifactory check, starting build ${_dir}"
+  _local_mvn_args="-Dmaven.test.skip=true -Ddependency-check.skip"
+  echo mvn ${MVN_ARGS} ${_local_mvn_args} -DGHIX_HOME=${SRC_HOME}/${_dir} clean ${build_target} -T 1C
+  mvn ${MVN_ARGS} ${_local_mvn_args} -DGHIX_HOME=${SRC_HOME}/${_dir} clean ${build_target} -T 1C
+  _rv=$?
+  cd ${basedir}
+  echo "$(date): done build ${_dir}"
+  if [[ $_rv != 0 ]]; then
+    false
+  fi
+}
+
+get_and_build()
+{
+  local _dir
+  _dir=$1
+  
+  if [[ $(eval echo \$${_dir}_build) == "false" ]] ; then
+    echo "$(date): Skipping build of ${_dir}"
+    return
+  fi
+
+  if source ${_dir} $2 $3; then
+    build ${_dir}
+  else
+    false
+    return
+  fi
+}
+
+platform()
+{
+  local ppid
+  local _run_test
+  local err
+
+  echo "Starting ${platform_repo} in $(pwd)..."
+
+  get_and_build ${platform_repo} ${platform_repo} ${platform_branch} > platform.log 2>&1 &
+  ppid=$!
+
+  err=
+  source models models ${models_branch} > models.log 2>&1 || err="${err} source models"
+  wait $ppid || err="${err} build ${platform_repo}"
+  cat platform.log
+  cat models.log
+  if [[ ${err} ]]; then
+    echo "Failed in ${err}"
+    false
+  else
+    true
+  fi
+}
+
+models()
+{
+  local mpid
+  local err
+
+  build models > models.log 2>&1 &
+  mpid=$!
+  source planmgmt planmgmt ${planmgmt_branch} > pm.log 2>&1 &
+  ppid=$!
+  err=
+  source enrollment enrollment ${enrollment_branch} > enrollment.log 2>&1 || err="${err} source enrollment"
+  wait $mpid || err="${err} build models"
+  cat models.log
+  wait $ppid || err="${err} source planmgmt"
+  cat pm.log
+  if [[ ${err} ]]; then
+    echo "Failed in ${err}"
+    false
+  else
+    true
+  fi
+}
+
+get_npm()
+{
+  local _d
+  local _f
+
+  _d=$1
+
+  echo "$(date): starting get_npm in $(pwd)"
+  nvm use lts/fermium
+  cd ${_d}
+  pkgver=$(git log -n 1 --pretty="%h" package.json)
+  node_tgz=${NODE_DIR}/${_d}/node_modules.${pkgver}.$(date +%Y%m%d).tgz
+  rm -rf node_modules
+  if [[ -f ${node_tgz} ]]; then
+    #
+    # found an existing package that matches, just use it.
+    #
+    echo "$(date) found existing ${node_tgz}, untarring in $(pwd)"
+    if tar xzf ${node_tgz} && npm run build; then
+      echo "$(date) finished run build in $(pwd)"
+      return
+    else
+      echo "$(date) WARNING: Failed to use cached npm, will reinstall now"
+      rm -rf node_modules
+    fi
+  else
+    echo "$(date) not found existing ${node_tgz}, installing in $(pwd)"
+  fi
+  #
+  # No existing package found. Let us generate one and keep for others to use
+  # First, clean uo the old directories
+  #
+  (cd ${NODE_DIR}; find . -type f -mtime +2 -print | xargs rm -f) &
+  if ! npm install; then
+    echo "ERROR: Failed to do npm install in $(pwd)"
+    exit 1
+  fi
+  mkdir -p ${NODE_DIR}/${_d}
+  echo "$(date): get_npm finished npm install"
+  #
+  # tar into a temp file to handle multiple builds in parallel. If all of
+  # them find a missing npm directory, there will be a conflict.
+  #
+  _f=$(mktemp ${node_tgz}.XXXXX)
+  tar czf ${_f} node_modules
+  mv ${_f} ${node_tgz}
+  echo "$(date) starting run build in $(pwd)"
+  if ! npm run build; then
+    echo "ERROR: Failed to do npm run build in $(pwd)"
+    exit 1
+  fi
+  echo "$(date) finished run build in $(pwd)"
+}
+
+get_source_and_npm()
+{
+  local _dir
+  local _profile
+  local _branch
+  local _repo
+  local _cdir
+  local _npmdir
+  local _npmpid
+  local _logs
+  local _spa_baseTag
+  local _single_spa
+
+  _dir=$1
+  _repo=$2
+  _branch=$3
+  _profile=$4
+  _cdir=$(pwd)
+  _spa_val="$(echo ${spa_NPM_DIRECTORY} | cut -d' ' -f1)"
+  _spa_dir="${_dir}/${_spa_val}"
+  _spa_baseTag=4450eeef3f
+  _single_spa=false
+
+  if ! source ${_dir} ${_repo} ${_branch} ${_profile}; then
+    echo "ERROR: Failed to get source, directory ${_dir}, branch ${_branch}, profile ${_profile}"
+    exit 1
+  fi
+
+  echo "$(date): get_source_and_npm: checking base tag"
+  cd ${_dir}
+  if git merge-base --is-ancestor ${_spa_baseTag} HEAD; then
+      _single_spa=true
+  fi
+  cd ${_cdir}
+  echo "$(date): get_source_and_npm: done checking base tag"
+
+  if [[ ${profile} == "id" && ${_single_spa} == "true" ]]; then
+     NPM_DIRECTORY="${ID_NPM_DIRECTORY} ${_spa_val}"
+  elif [[ ${profile} == "id" ]]; then
+     NPM_DIRECTORY=${ID_NPM_DIRECTORY}
+  elif [[ ${profile} =~ "id" ]]; then
+     NPM_DIRECTORY="${ALL_NPM_DIRECTORY} ${_spa_val}"
+  elif [[ -d ${_spa_dir} ]];then
+     NPM_DIRECTORY=${spa_NPM_DIRECTORY}
+  else
+     NPM_DIRECTORY=${ALL_NPM_DIRECTORY}
+  fi
+  echo "$(date): get_npm: NPM_DIRECTORY is ${NPM_DIRECTORY}"
+  _logs=
+  _npmpid=
+  for _d in ${NPM_DIRECTORY}; do
+    if [[ -f ${_dir}/${_d}/package.json ]]; then
+      cd ${_dir}
+      _l=$(mktemp ${_cdir}/npmlog.XXXXXXXX)
+      get_npm ${_d} > ${_l} 2>&1 &
+      _npmpid="${_npmpid} $!"
+      _logs="${_logs} ${_l}"
+      cd ${_cdir}
+    fi
+  done
+
+  ret=true
+  for _p in ${_npmpid}; do
+    wait ${_p} || ret=false
+  done
+
+  cat ${_logs}
+  rm -f ${_logs}
+  ${ret}
+}
+
+get_web_source()
+{
+  local web_profile
+  local _log
+  local _wpid
+
+  for web_profile in ${IEX_PROFILES}; do
+    if [[ ${profile} =~ ${web_profile} ]]; then
+      get_source_and_npm ${web_profile} iex ${iex_branch} ${web_profile} > ${web_profile}.log 2>&1 &
+      web_pid="${web_pid} $!"
+      _log="${_log} ${web_profile}.log"
+    fi
+  done
+
+  if [[ ${profile} =~ phix ]]; then
+    get_source_and_npm phix phix ${phix_branch} phix > phix.log 2>&1 &
+    web_pid="${web_pid} $!"
+    _log="${_log} phix.log"
+  fi
+
+  _ret=true
+  for _wpid in ${web_pid}; do
+    wait ${_wpid} || _ret=false
+  done
+
+  cat ${_log}
+  ${_ret}
+}
+
+shared()
+{
+  local pdpid
+  local epid
+  local pmpid
+  local fpid
+  local idpid
+  local nmpid
+  local eligpid
+  local err
+
+  echo "Starting planmgmt in $(pwd) ..."
+  build planmgmt > pm.log 2>&1 &
+  pmpid=$!
+
+  echo "Starting enrollment in $(pwd) ..."
+  build enrollment > enroll.log 2>&1 &
+  epid=$!
+
+  source plandisplay plandisplay ${plandisplay_branch} > pd.log 2>&1 &
+  pdpid=$!
+
+  echo "Starting finance in $(pwd) ..."
+  get_and_build finance finance ${finance_branch} > finance.log 2>&1 &
+  fpid=$!
+
+  echo "Starting identity in $(pwd) ..."
+  get_and_build identity identity ${identity_branch} > identity.log 2>&1 &
+  idpid=$!
+
+  if ! [[ ${profile} =~ phix ]]; then
+    edi_build > edi.log 2>&1 &
+    edipid=$!
+
+    echo "Starting eligibility-engine in $(pwd) ..."
+    get_and_build eligibility-engine eligibility-engine ${eligibility_engine_branch} > elig.log 2>&1 &
+    eligpid=$!
+  fi
+
+  if [[ ${profile} =~ nm ]]; then
+    source nm shop ${shop_branch} nm > nm.log 2>&1 &
+    nmpid=$!
+  fi
+
+  if [[ ${profile} =~ ms ]]; then
+    source ms shop ${shop_branch} ms > ms.log 2>&1 &
+    mspid=$!
+  fi
+
+  err=
+  wait ${pmpid} || err="${err} planmgmt build"
+  cat pm.log
+  wait ${epid} || err="${err} enrollment build"
+  cat enroll.log
+  if wait ${pdpid}; then
+    echo "Starting plandisplay in $(pwd) ..."
+    build plandisplay >> pd.log 2>&1 || err="${err} build plandisplay"
+    cat pd.log
+  else
+    err="${err} source plandisplay"
+    cat pd.log
+  fi
+
+  wait ${fpid} || err="${err} build finance"
+  cat finance.log
+  wait ${idpid} || err="${err} build identity"
+  cat identity.log
+
+  if [[ ${eligpid} ]]; then
+    wait ${eligpid} || err="${err} build eligibility-engine"
+    cat elig.log
+  fi
+
+  if [[ ${edipid} ]]; then
+    wait ${edipid} || err="${err} edi build"
+    cat edi.log
+  fi
+  if [[ ${err} ]]; then
+    echo "Failed : ${err}"
+    false
+  else
+    true
+  fi
+}
+
+edi_build()
+{
+  local _flist
+  if source ghix_edi ghix_edi ${ghix_edi_branch} > edi.log 2>&1; then
+    cd ghix_edi
+    _flist=$(ls)
+    tar czf edi_files.tar.gz ${_flist}
+    cd ${basedir}
+  else
+    false
+  fi
+}
+
+web_build()
+{
+  local _dir
+  local _profile
+  local _local_mvn_args
+
+  _dir=$1
+  _profile=$2
+
+  ret=true
+  echo "$(date): Starting web_build ${_dir} ${_profile} in $(pwd) ..."
+  cd ${_dir}
+  [[ ${_profile} == "ca" && -f pom.ca.xml ]] && _local_mvn_args="-f pom.ca.xml"
+  if git merge-base --is-ancestor SJC-ARTIFACTORY HEAD; then
+    artifactory_url=${sjc_artifactory}
+    m2_path=${sjc_m2}
+    settings_xml=${settings_xml_sjc}
+    set_env
+  fi
+  echo mvn ${_local_mvn_args} ${MVN_ARGS} -Dmaven.test.skip=true -Ddependency-check.skip -DGHIX_HOME=${SRC_HOME}/${_dir} -P${_profile} clean ${build_target} -T 2C || ret=false
+  mvn ${_local_mvn_args} ${MVN_ARGS} -Dmaven.test.skip=true -Ddependency-check.skip -DGHIX_HOME=${SRC_HOME}/${_dir} -P${_profile} clean ${build_target} -T 2C || ret=false
+  cd ${basedir}
+  echo "$(date): done web build"
+  $ret
+}
+
+do_builds()
+{
+  local web_pid
+  local err
+  set_env
+  err=
+
+  get_web_source > web.log 2>&1 &
+  web_pid=$!
+
+  if ! platform || \
+     ! models || \
+     ! (source extern_libs ghix-lib master > libs.log 2>&1 &) || \
+     ! shared ; then
+    [[ -f libs.log ]] && cat libs.log
+    false
+    return
+  fi
+  cat libs.log
+
+  wait ${web_pid} || err="${err} source web"
+  cat web.log
+
+  if [[ ${err} ]]; then
+    echo "Failed: ${err}"
+    false
+    return
+  fi
+
+  for build in ${BUILDS}; do
+    if [[ ${profile} =~ ${build} ]];  then
+     echo "Building iex for profile ${profile}"
+     if ! web_build "$build" "$build" > ${build}.log 2>&1; then
+	cat ${build}.log
+	echo "Failed to build ${build}"
+	false
+	return
+     else
+        cat ${build}.log
+     fi
+    fi
+  done
+
+}
+
+WORKSPACE=${WORKSPACE:-$(pwd)}
+cmd=$0
+
+artifactory_url=http://artifactory.ghixqa.com:8081/artifactory/libs-snapshot-local
+m2_path=${WORKSPACE}/m2.do
+settings_xml=settings.xml.do
+sjc_artifactory=http://sjc-artifactory.eng.vimo.com:8082/artifactory/libs-snapshot-local
+sjc_m2=${WORKSPACE}/m2.sjc
+settings_xml_sjc=settings.xml.sjc
+
+trap 'rm -f ${WORKSPACE}/*.log' 0
+
+SHELL_DIR=${SHELL_DIR:-${GHIX_DEVOPS}/build/jenkins/shell}
+. ${SHELL_DIR}/build-functions
+
+REPOS="platform models planmgmt plandisplay enrollment finance identity iex eligibility-engine phix shop ghix_edi"
+BUILDS="id ca wa nj pa nv mn nm ms phix ga gi va"
+platform_repo=platform
+
+branch=master
+#profile="${profile:-}"
+build_target=install
+local_mvn_settings=
+basedir=$(pwd)
+verbose="-q"
+NPM_DIRECTORY=
+use_OpenJDK16=false
+use_JDK17=false
+update_artifactory=false
+
+while [[ $1 ]]; do
+  case $1 in
+    --help|-h) usage; exit 0;;
+    --no-update) _build_source_update=false;;
+    --deploy) build_target=deploy;;
+    --buildnum=*) _build_num=${1#*=};;
+    --profile=*) profile="${1#*=}";;
+    --branch=*) branch=${1#*=};;
+    --boot) echo "Boot target not yet implemented"; exit 1;;
+    --mvn-settings=*) local_mvn_settings=${1#--mvn-settings=};;
+    --verbose=*) verbose=${1#*=};;
+    --use_OpenJDK16=*) use_OpenJDK16=${1#*=};;
+    --use_JDK17=*) use_JDK17=${1#*=};;
+    --update-artifactory) update_artifactory=true;;
+    --*=*) v=${1#--}
+           v=${v%=*}
+           val=${1#*=}
+           eval ${v}_branch=${val};;
+    *) usage; exit 1
+  esac
+  shift
+done
+
+if [[ ${verbose} == "verbose" ]]; then
+  verbose="-X"
+elif [[ ${verbose} == "normal" ]]; then
+  verbose=
+else
+  verbose="-q"
+fi
+
+for r in ${REPOS}; do
+  r=${r//-/_}
+  eval [[ \$${r}_branch ]] && continue
+  eval [[ \$${r} ]] && eval ${r}_branch=\$${r}
+done
+
+for bld in id ca wa mn ct nv nj pa nm ms phix ga gi; do
+  [[ $(eval echo \$${bld}_build) == true ]] && \
+    profile="$profile ${bld}"
+done
+
+if [[ ! ${profile} ]]; then
+  profile="pa"
+  pa_build=true
+elif [[ ${profile} =~ phix ]]; then
+  phix_build=true
+  REPOS="${REPOS} phix_platform"
+  platform_repo=phix_platform
+  phix_platform_branch=${platform_branch}
+  profile="phix"
+  if [[ ${profile/phix/} ]]; then
+    echo "WARNING: phix build not compatible with other profiles, ignoring all other profiles"
+  fi
+else
+  for p in ${profile}; do
+    case ${p} in
+      id|ca|nv|mn|ct|wa|nj|pa|nm|ms|ga)
+        eval ${p}_build=true;;
+      iex)
+        id_build=true
+        ca_build=true
+        wa_build=true
+        ## ct_build=true
+        mn_build=true
+        nv_build=true
+        pa_build=true
+        nj_build=true
+        ga_build=true
+        gi_build=true
+        profile="id ca wa nj pa nv mn ga gi va";;
+      shop)
+        nm_build=true
+        ms_build=true
+        profile="nm ms";;
+      all)
+        ## nm_build=true
+        ## ms_build=true
+        id_build=true
+        ca_build=true
+        wa_build=true
+        mn_build=true
+        nv_build=true
+        pa_build=true
+        nj_build=true
+        ga_build=true
+        gi_build=true
+        profile="id ca wa nj pa nv mn ga gi va";;
+    esac
+  done
+fi
+
+buildtime=${_build_num}-$(date "+%Y-%m-%d")
+
+for br in ${REPOS}
+do
+  _b=${br//-/_}
+  eval v=\$${_b}_branch
+  [[ ! ${v} ]] && eval ${_b}_branch=$branch
+  eval echo "Using branch \$${_b}_branch for ${br} "
+done
+
+do_builds || exit 1
